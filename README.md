@@ -1,9 +1,10 @@
 # fast-rtxvsr
 
-Standalone NVIDIA RTX Video Super Resolution for video files: upscale a clip
-to delivery size with the real VSR model, straight from the command line.
-No ComfyUI server, no PNG roundtrips, no separate denoise pass. Decode,
-super-resolve, and encode all happen on the GPU in one pass.
+Standalone NVIDIA RTX Video Super Resolution for video files **and still
+images**: upscale a clip or a batch of photos with the real VSR model,
+straight from the command line or a small desktop GUI. No ComfyUI server, no
+PNG roundtrips, no separate denoise pass. For video, decode, super-resolve,
+and encode all happen on the GPU in one pass.
 
 Examples:
 
@@ -19,6 +20,12 @@ Examples:
 ```text
 fast-rtxvsr run input.mp4 --width 1920 --height 1080
 -> out/<project>/input/input_vsr.mp4   (1920x1080, VSR ULTRA)
+
+fast-rtxvsr run photo.png shot.jpg --scale 2
+-> out/<project>/photo_vsr.png, shot_vsr.jpg   (2x, model loaded once)
+
+fast-rtxvsr gui
+-> desktop window: queue files, pick size/quality, Run
 ```
 
 ## Why this exists
@@ -134,19 +141,50 @@ fast-rtxvsr run input.mp4 --width 1920 --height 1080 --quality ULTRA \
     --codec h264 --preset P7 --bitrate 16000000 --device 0
 ```
 
-By default each output lands under `<repo>/out/<source-project>/<clip-stem>/`
-as `<clip-stem>_vsr.mp4`; `--out-dir` writes clips directly there. Output
-dimensions are rounded up to an 8px multiple (the VSR model's alignment).
+By default each video lands under `<repo>/out/<source-project>/<clip-stem>/`
+as `<clip-stem>_vsr.mp4` and each image under `<repo>/out/<source-project>/`
+as `<stem>_vsr.<ext>`; `--out-dir` writes everything directly there. Output
+dimensions are rounded to an 8px multiple (the VSR model's alignment).
+
+### Images
+
+Any input whose extension is `png / jpg / jpeg / webp / bmp / tif / tiff` is
+treated as a still image. All images in one `run` call go through a single
+worker process so the model loads once, and a batch may mix sizes freely -
+the model infers input size per frame. `--scale N` sizes each output from its
+own input (`--width/--height` still apply to any videos in the same call);
+without `--scale`, images get the same fixed `--width x --height` as videos.
+Output keeps the source format unless `--image-ext` overrides it (JPEG at
+quality 95 / 4:4:4, WebP at 95). Alpha channels survive: RGB goes through
+VSR, the alpha plane is upscaled bilinearly and re-attached, and embedded ICC
+profiles are carried over.
+
+### GUI
+
+```bash
+fast-rtxvsr gui        # or: fast-rtxvsr-gui
+```
+
+A tkinter window (ships with Python, no extra dependency): add files or a
+whole folder, choose a fixed output size or an image scale factor, quality,
+codec/preset/bitrate for video, image format and output folder, then Run.
+The GUI shells out to `fast-rtxvsr run` and streams its events into the log,
+so it behaves exactly like the CLI; "Open output" opens the result folder.
 
 ### CLI reference
 
 ```
 fast-rtxvsr setup [--python PATH]
 fast-rtxvsr probe [--python PATH]
-fast-rtxvsr run INPUT [options]
+fast-rtxvsr gui
+fast-rtxvsr run INPUT [INPUT ...] [options]    (videos and/or images)
 
   --width WIDTH        Output width (default 1920)
   --height HEIGHT      Output height (default 1080)
+  --scale SCALE        Images only: output = input * SCALE (8px aligned);
+                       overrides --width/--height for images
+  --image-ext EXT      Images only: output format png | jpg | webp
+                       (default: keep the source format)
   --quality QUALITY    LOW | MEDIUM | HIGH | ULTRA  (default ULTRA)
   --codec CODEC        h264 (default) | hevc | av1  (nvenc aliases h264)
   --preset PRESET      NVENC P1..P7 (default P7, highest quality)
@@ -170,6 +208,10 @@ debugging only.
 
 `fast-rtxvsr run` stdout is pure JSON, one object per line - easy to consume
 from a script:
+
+Image batches emit `{"log": "image", ...}` per file and a final
+`{"event": "done", "mode": "image", "images": N, "results": [...]}` with the
+input/output path and size of each file.
 
 ```json
 {"log": "device", "mode": "video", "path": "gpu", "cuda_index": 0, "device": "NVIDIA GeForce RTX 5060 Ti", "quality": "ULTRA", "output": "1920x1080"}
@@ -244,7 +286,7 @@ fast-rtxvsr does not vendor any NVIDIA binaries in its own repository;
 
 ## Out of scope
 
-This is the fast RTX Video Super Resolution CLI only. DLSS video upscale,
+This is the fast RTX Video Super Resolution CLI/GUI only. DLSS video upscale,
 DLSS frame interpolation, and any ComfyUI-graph integration are not covered
 here. For DLSS Frame Generation see the companion
 [fast-dlssfg](https://github.com/glarsson/fast-dlssfg) project.

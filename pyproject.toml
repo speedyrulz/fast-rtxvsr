@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fast-rtxvsr"
-version = "1.0.0"
+version = "1.1.0"
 description = "Standalone NVIDIA RTX Video Super Resolution CLI - GPU decode -> VSR -> encode in one pass, no ComfyUI server."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -17,6 +17,7 @@ dependencies = [
 
 [project.scripts]
 fast-rtxvsr = "fast_rtxvsr.cli:main"
+fast-rtxvsr-gui = "fast_rtxvsr.gui:main"
 
 [tool.setuptools.packages.find]
 include = ["fast_rtxvsr*"]

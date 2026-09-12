@@ -3,6 +3,8 @@
 Video mode (the default): decode -> GPU VSR -> encode in one pass.
 Prefers NVDEC + NVENC (PyNvVideoCodec) so pixels stay on the GPU.
 Falls back to PyAV host frames if that wheel is missing or init fails.
+Image mode: one or more still images (PNG/JPG/WebP/...), model loaded once,
+each written back in its source format with alpha preserved.
 Legacy frame mode: PNG/JPG folders for debugging only.
 
 Run with the fast-rtxvsr venv interpreter (provisioned by ``fast-rtxvsr
@@ -562,6 +564,159 @@ def run_video(args: argparse.Namespace) -> int:
     return _run_video_host(args)
 
 
+IMAGE_EXTS = frozenset({".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"})
+
+
+def _align8(value: float) -> int:
+    return max(8, int(round(value / 8) * 8))
+
+
+def _resolve_output_size(
+    in_w: int, in_h: int, width: int | None, height: int | None, scale: float | None
+) -> tuple[int, int]:
+    """Output size for one frame: --scale wins, else --width/--height."""
+    if scale and scale > 0:
+        return _align8(in_w * scale), _align8(in_h * scale)
+    return _align8(int(width or 1920)), _align8(int(height or 1080))
+
+
+def _save_image(image, dest: Path, source_info: dict) -> None:
+    """Write a PIL image in the format its extension implies, high quality."""
+    suffix = dest.suffix.lower()
+    kwargs: dict = {}
+    if suffix in {".jpg", ".jpeg"}:
+        kwargs = {"quality": 95, "subsampling": 0}
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+    elif suffix == ".webp":
+        kwargs = {"quality": 95, "method": 6}
+    elif suffix == ".png":
+        kwargs = {"compress_level": 6}
+    icc = source_info.get("icc_profile")
+    if icc:
+        kwargs["icc_profile"] = icc
+    image.save(dest, **kwargs)
+
+
+def run_images(args: argparse.Namespace) -> int:
+    """Upscale still images: model loaded once, one sr.run() per image.
+
+    Input size is inferred per call and output size may change between
+    calls, so a batch can mix sizes; --scale derives each output from its
+    own input. Alpha is upscaled separately (bilinear) and re-attached.
+    """
+    import numpy as np
+    import torch
+    import torch.nn.functional as F
+    import nvvfx
+    from PIL import Image
+
+    gpu = int(args.device)
+    if not torch.cuda.is_available():
+        _log_event({"ok": False, "error": "CUDA unavailable in worker Python"})
+        return 2
+    inputs = [Path(p) for p in args.input_images]
+    outputs = [Path(p) for p in args.output_images]
+    if len(inputs) != len(outputs):
+        _log_event({"ok": False, "error": "--input-images/--output-images length mismatch"})
+        return 2
+    missing = [str(p) for p in inputs if not p.is_file()]
+    if missing:
+        _log_event({"ok": False, "error": f"input not found: {missing[0]}"})
+        return 2
+
+    torch.cuda.set_device(gpu)
+    device_name = torch.cuda.get_device_name(gpu)
+    quality = getattr(nvvfx.effects.QualityLevel, args.quality)
+    stream_ptr = torch.cuda.current_stream().cuda_stream
+    scale = float(args.scale) if args.scale else None
+    device = f"cuda:{gpu}"
+
+    _log_event(
+        {
+            "log": "device",
+            "mode": "image",
+            "cuda_index": gpu,
+            "device": device_name,
+            "quality": args.quality,
+            "output": f"x{scale:g}" if scale else f"{_align8(args.width)}x{_align8(args.height)}",
+            "images": len(inputs),
+        }
+    )
+
+    started = time.time()
+    results: list[dict] = []
+    with nvvfx.VideoSuperRes(quality=quality, device=gpu) as sr:
+        current_size: tuple[int, int] | None = None
+        for src, dest in zip(inputs, outputs):
+            with Image.open(src) as pil:
+                pil.load()
+                info = dict(pil.info)
+                has_alpha = pil.mode in {"RGBA", "LA"} or (
+                    pil.mode == "P" and "transparency" in pil.info
+                )
+                rgba = pil.convert("RGBA") if has_alpha else None
+                rgb = (rgba if rgba is not None else pil).convert("RGB")
+            in_w, in_h = rgb.size
+            out_w, out_h = _resolve_output_size(in_w, in_h, args.width, args.height, scale)
+            if current_size != (out_w, out_h):
+                sr.output_width = out_w
+                sr.output_height = out_h
+                if not sr.is_loaded:
+                    sr.load()
+                    _log_event({"log": "model_loaded", "loaded": bool(sr.is_loaded)})
+                current_size = (out_w, out_h)
+
+            arr = np.asarray(rgb, dtype=np.float32) / 255.0
+            tensor = torch.from_numpy(arr).permute(2, 0, 1).contiguous().to(device)
+            out = torch.from_dlpack(sr.run(tensor, stream_ptr=stream_ptr).image).clone()
+            out_u8 = (
+                out.clamp(0.0, 1.0)
+                .mul_(255.0)
+                .round_()
+                .to(torch.uint8)
+                .permute(1, 2, 0)
+                .contiguous()
+            )
+            if rgba is not None:
+                alpha = torch.from_numpy(np.asarray(rgba)[:, :, 3:4].copy()).to(device)
+                alpha = alpha.permute(2, 0, 1).unsqueeze(0).float()
+                alpha = F.interpolate(
+                    alpha, size=(out_h, out_w), mode="bilinear", align_corners=False
+                )
+                alpha_u8 = alpha[0].round_().clamp_(0, 255).to(torch.uint8).permute(1, 2, 0)
+                out_u8 = torch.cat((out_u8, alpha_u8), dim=2).contiguous()
+            result = Image.fromarray(
+                out_u8.cpu().numpy(), "RGBA" if rgba is not None else "RGB"
+            )
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            _save_image(result, dest, info)
+            results.append(
+                {
+                    "input": str(src),
+                    "output": str(dest),
+                    "input_size": f"{in_w}x{in_h}",
+                    "output_size": f"{out_w}x{out_h}",
+                    "alpha": rgba is not None,
+                }
+            )
+            _log_event({"log": "image", **results[-1]})
+
+    elapsed = time.time() - started
+    payload = {
+        "ok": True,
+        "mode": "image",
+        "device": device_name,
+        "cuda_index": gpu,
+        "images": len(results),
+        "seconds": round(elapsed, 2),
+        "fps": round(len(results) / elapsed, 2) if elapsed else 0.0,
+        "results": results,
+    }
+    _log_event(payload)
+    return 0
+
+
 def run_frames(args: argparse.Namespace) -> int:
     import torch
     import nvvfx
@@ -646,8 +801,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-video", type=Path, default=None)
     parser.add_argument("--frames-in", type=Path, default=None)
     parser.add_argument("--frames-out", type=Path, default=None)
-    parser.add_argument("--width", required=True, type=int)
-    parser.add_argument("--height", required=True, type=int)
+    parser.add_argument("--input-images", nargs="+", default=None)
+    parser.add_argument("--output-images", nargs="+", default=None)
+    parser.add_argument("--width", type=int, default=1920)
+    parser.add_argument("--height", type=int, default=1080)
+    parser.add_argument(
+        "--scale",
+        type=float,
+        default=None,
+        help="Image mode: output = input * scale (8px aligned); overrides --width/--height.",
+    )
     parser.add_argument(
         "--quality", default="ULTRA", choices=["LOW", "MEDIUM", "HIGH", "ULTRA"]
     )
@@ -670,7 +833,12 @@ def main(argv: list[str] | None = None) -> int:
         return run_video(args)
     if args.frames_in and args.frames_out:
         return run_frames(args)
-    parser.error("pass --input-video + --output-video, or --frames-in + --frames-out")
+    if args.input_images and args.output_images:
+        return run_images(args)
+    parser.error(
+        "pass --input-video + --output-video, --input-images + --output-images, "
+        "or --frames-in + --frames-out"
+    )
 
 
 if __name__ == "__main__":

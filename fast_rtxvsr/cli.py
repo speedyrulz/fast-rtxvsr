@@ -2,7 +2,8 @@
 
     fast-rtxvsr setup [--python PATH]         provision (or point at) a worker env
     fast-rtxvsr probe [--python PATH]         show what the worker env can see
-    fast-rtxvsr run INPUT [options]           upscale a video to delivery size
+    fast-rtxvsr run INPUT [options]           upscale video(s) / image(s)
+    fast-rtxvsr gui                           open the desktop GUI
 
 ``fast-rtxvsr run`` stdout is machine-readable: line-delimited JSON events
 (device / encoder / model_loaded / ok / done), one object per line. Human
@@ -27,9 +28,29 @@ from .env import (
     resolve_python,
 )
 from .media import attach_source_audio, probe_video_summary
-from .vsr import _normalize_codec
+from .vsr import IMAGE_EXTS, _normalize_codec
 
 QUALITY_CHOICES = ("LOW", "MEDIUM", "HIGH", "ULTRA")
+
+
+def is_image_path(path: Path) -> bool:
+    return path.suffix.lower() in IMAGE_EXTS
+
+
+def _resolve_image_dest(src: Path, out_dir: Path | None, ext: str | None) -> Path:
+    """Output file for one image: <stem>_vsr.<ext> next to the video layout.
+
+    With --out-dir the image writes directly there; by default it lands
+    under <repo>/out/<parent-project>/. The source format is kept unless
+    --image-ext overrides it.
+    """
+    suffix = f".{ext.lstrip('.').lower()}" if ext else src.suffix.lower()
+    if suffix == ".jpeg":
+        suffix = ".jpg"
+    name = f"{src.stem}_vsr{suffix}"
+    if out_dir is not None:
+        return Path(out_dir).expanduser().resolve() / name
+    return repo_root() / "out" / src.parent.name / name
 
 
 def _resolve_video_dest(src: Path, out_dir: Path | None) -> Path:
@@ -75,21 +96,36 @@ def build_parser() -> argparse.ArgumentParser:
     )
     probe.add_argument("--python", default=None, help="Interpreter to probe.")
 
+    sub.add_parser("gui", help="Open the desktop GUI (tkinter).")
+
     run = sub.add_parser(
         "run",
-        help="Upscale one video to the target size (or upscale a PNG/JPG folder).",
+        help="Upscale video(s) and/or image(s) to the target size.",
     )
     run.add_argument(
         "input",
         nargs="*",
         default=None,
-        help="Input video file(s). Omit when using --frames-in.",
+        help="Input video and/or image file(s) (png/jpg/webp/bmp/tif). "
+        "Omit when using --frames-in.",
     )
     run.add_argument(
         "--width", type=int, default=1920, help="Output width (default 1920)."
     )
     run.add_argument(
         "--height", type=int, default=1080, help="Output height (default 1080)."
+    )
+    run.add_argument(
+        "--scale",
+        type=float,
+        default=None,
+        help="Images only: output = input * SCALE (e.g. 2), rounded to 8px; "
+        "overrides --width/--height for images.",
+    )
+    run.add_argument(
+        "--image-ext",
+        default=None,
+        help="Images only: output format (png, jpg, webp). Default keeps the source format.",
     )
     run.add_argument(
         "--quality",
@@ -304,6 +340,63 @@ def _run_one_video(
     return 0
 
 
+def _run_images(srcs: list[Path], python: Path, args: argparse.Namespace) -> int:
+    """Upscale a batch of still images in one worker call (model loads once)."""
+    dests = [_resolve_image_dest(src, args.out_dir, args.image_ext) for src in srcs]
+    target = f"x{args.scale:g}" if args.scale else f"{args.width}x{args.height}"
+    print(
+        f"[fast-rtxvsr] RTX VSR quality={args.quality} {len(srcs)} image(s) -> {target}",
+        file=sys.stderr,
+    )
+    started = time.time()
+    argv = [
+        "--input-images",
+        *map(str, srcs),
+        "--output-images",
+        *map(str, dests),
+        "--width",
+        str(args.width),
+        "--height",
+        str(args.height),
+        "--quality",
+        args.quality,
+        "--device",
+        str(args.device),
+    ]
+    if args.scale:
+        argv += ["--scale", str(args.scale)]
+    events = _run_worker(python, argv)
+    payload = _final_payload(events)
+    if not payload.get("ok"):
+        print(f"[fast-rtxvsr] VSR failed: {payload.get('error')}", file=sys.stderr)
+        return 1
+    elapsed = time.time() - started
+    for item in payload.get("results") or []:
+        print(
+            f"[fast-rtxvsr] {Path(item['output']).name}  "
+            f"{item['input_size']} -> {item['output_size']}",
+            file=sys.stderr,
+        )
+    print(
+        f"[fast-rtxvsr] {payload.get('images')} image(s) in {elapsed:.1f}s wall",
+        file=sys.stderr,
+    )
+    print(
+        json.dumps(
+            {
+                "event": "done",
+                "mode": "image",
+                "images": payload.get("images"),
+                "wall_clock_sec": round(elapsed, 2),
+                "device": payload.get("device"),
+                "results": payload.get("results"),
+            }
+        ),
+        flush=True,
+    )
+    return 0
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     # ensure_worker_python verifies the interpreter is healthy (or provisions
     # the venv); a broken one raises before any work starts.
@@ -352,13 +445,25 @@ def cmd_run(args: argparse.Namespace) -> int:
         return 0
 
     if not args.input:
-        print("[fast-rtxvsr] run needs an INPUT video (or --frames-in)", file=sys.stderr)
+        print(
+            "[fast-rtxvsr] run needs INPUT video/image file(s) (or --frames-in)",
+            file=sys.stderr,
+        )
         return 2
+    images: list[Path] = []
+    videos: list[Path] = []
     for item in args.input:
         src = Path(item).expanduser().resolve()
         if not src.is_file():
             print(f"[fast-rtxvsr] input not found: {src}", file=sys.stderr)
             return 2
+        (images if is_image_path(src) else videos).append(src)
+
+    if images:
+        code = _run_images(images, python, args)
+        if code:
+            return code
+    for src in videos:
         dest = _resolve_video_dest(src, args.out_dir)
         code = _run_one_video(src, dest, python, codec, args)
         if code:
@@ -375,6 +480,10 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_probe(args)
         if args.command == "run":
             return cmd_run(args)
+        if args.command == "gui":
+            from .gui import main as gui_main
+
+            return gui_main()
     except Exception as exc:  # noqa: BLE001 - clean failure, no traceback
         print(f"[fast-rtxvsr] error: {exc}", file=sys.stderr)
         return 1
